@@ -1,0 +1,26 @@
+# Reference hyperparameters for a real PhysioNet-2012 run.
+# train.py currently takes these as CLI flags (see `python -m src.training.train --help`);
+# this file documents the recommended starting point.
+
+data:
+  max_hours: 48.0
+  bin_size_hours: 1.0        # hourly grid; see src/data/preprocessing.py docstring
+  val_frac: 0.1
+  test_frac: 0.1
+
+training:
+  epochs: 30
+  batch_size: 32
+  lr: 0.001
+  seed: 0
+
+model_dims:
+  hidden: 64
+  latent_ode:
+    latent_dim: 16
+    solver: dopri5           # swap to 'rk4' + fixed step for a 5-10x speedup while iterating
+  neural_cde:
+    hidden_channels: 32
+    interpolation: cubic     # 'linear' is faster and a fine default while debugging
+    solver: rk4
+    step_size: 1.0
