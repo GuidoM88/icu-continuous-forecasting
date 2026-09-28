@@ -59,12 +59,21 @@ def parse_record_file(path: Path) -> PatientRecord:
         for row in reader:
             if not row or len(row) < 3:
                 continue
-            time_str, param, value_str = row[0], row[1], row[2]
+            time_str = row[0].strip()
+            param = row[1].strip()
+            value_str = row[2].strip()
+
+            # Some released files may contain malformed/blank CSV rows.
+            # An empty Parameter is not a physiological variable and must
+            # never enter the model vocabulary.
+            if not time_str or not param or not value_str:
+                continue
+
             try:
                 value = float(value_str)
-            except ValueError:
+                t = _time_to_hours(time_str)
+            except (ValueError, TypeError):
                 continue
-            t = _time_to_hours(time_str)
 
             if param == "RecordID":
                 record_id = str(int(value))
@@ -91,10 +100,15 @@ def load_outcomes(path: Path) -> Dict[str, int]:
 
 
 def load_split(
-    raw_dir: Path, split: str = "set-a", outcomes_file: Optional[str] = "Outcomes-a.txt"
+    raw_dir: Path, split: str = "set-a", outcomes_file: Optional[str] = None
 ) -> List[PatientRecord]:
-    """Parse every record in a split directory (e.g. 'set-a') and attach
-    labels if an outcomes file is available (only set-a ships outcomes)."""
+    """Parse every record in a split directory.
+
+    Competition-safe default:
+      - set-a automatically uses Outcomes-a.txt;
+      - set-b / set-c remain unlabeled unless an outcomes file is explicitly
+        supplied for retrospective scoring.
+    """
     split_dir = raw_dir / split
     files = sorted(split_dir.glob("*.txt"))
     if not files:
@@ -102,6 +116,8 @@ def load_split(
             f"No .txt records found under {split_dir}. Did you run "
             f"data/download_physionet2012.sh ?"
         )
+    if outcomes_file is None and split == "set-a":
+        outcomes_file = "Outcomes-a.txt"
     outcomes = load_outcomes(raw_dir / outcomes_file) if outcomes_file else {}
 
     records = []

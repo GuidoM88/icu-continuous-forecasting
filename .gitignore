@@ -1,8 +1,20 @@
+# Python
 __pycache__/
 *.pyc
 .pytest_cache/
-data/raw/
-results/
-*.pth
+
+# Jupyter
 .ipynb_checkpoints/
+
+# Data
+data/raw/
+
+# Training artifacts
+checkpoints/
+results/
+*.pt
+*.pth
+*.ckpt
+
+# OS
 .DS_Store

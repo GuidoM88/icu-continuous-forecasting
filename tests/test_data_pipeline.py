@@ -61,3 +61,24 @@ def test_fill_forward_unobserved_prefix_is_zero():
     assert filled[0, 0, 0] == 0.0
     assert filled[0, 1, 0] == 0.0
     assert filled[0, 2, 0] == 3.0
+
+
+def test_vocab_filters_blank_variable_names():
+    records = make_synthetic_records(n=2, seed=9)
+    records[0].values[""] = [(1.0, 123.0)]
+    records[0].values["   "] = [(2.0, 456.0)]
+    vocab = build_vocab(records)
+    assert "" not in vocab
+    assert not any(v.isspace() for v in vocab)
+
+
+def test_unlabeled_records_can_be_collated_for_inference():
+    records = make_synthetic_records(n=4, seed=10)
+    vocab = build_vocab(records)
+    normalizer = Physionet2012Dataset(records, vocab).fit_normalizer()
+    for r in records:
+        r.label = None
+    ds = Physionet2012Dataset(records, vocab, normalizer=normalizer)
+    batch = ds.collate(range(4))
+    assert len(ds) == 4
+    assert np.isnan(batch.labels.numpy()).all()

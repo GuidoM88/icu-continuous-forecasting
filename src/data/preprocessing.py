@@ -38,7 +38,9 @@ def build_vocab(records: Sequence[PatientRecord]) -> List[str]:
     appears in every release / subsample of the data."""
     vocab = set()
     for r in records:
-        vocab.update(r.values.keys())
+        # Defensive filtering: malformed blank variable names must never
+        # become model features, even if a PatientRecord was built elsewhere.
+        vocab.update(v.strip() for v in r.values.keys() if v and v.strip())
     return sorted(vocab)
 
 
@@ -136,7 +138,9 @@ class Physionet2012Dataset:
         bin_size_hours: float = 1.0,
         normalizer: "Normalizer | None" = None,
     ):
-        self.records = [r for r in records if r.label is not None]
+        # Keep unlabeled records: Set B/C must be transformable at inference
+        # time without exposing their outcomes.
+        self.records = list(records)
         self.vocab = list(vocab)
         self.static_names = list(static_names)
         self.var_index = {v: i for i, v in enumerate(self.vocab)}
@@ -185,7 +189,8 @@ class Physionet2012Dataset:
         )
         if normalize and self.normalizer is not None:
             values, static = self.normalizer.apply(values, static)
-        return values, mask, static, float(rec.label)
+        label = np.nan if rec.label is None else float(rec.label)
+        return values, mask, static, label
 
     def collate(self, indices: Sequence[int]) -> Batch:
         if self.normalizer is None:

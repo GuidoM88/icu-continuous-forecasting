@@ -6,7 +6,7 @@ Neural ODEs and Neural CDEs applied to irregularly-sampled, partially-observed c
 
 Standard sequence models (RNNs, Transformers) assume data arrives on a regular grid. Clinical time series rarely do: in an ICU, heart rate might be checked every 15 minutes while a lab value is drawn twice a day, entire hours can pass with no measurement at all, and the frequency of measurement is itself informative — a clinician ordering more frequent tests is a signal about how sick a patient is.
 
-This repo implements and compares a family of models built specifically for that setting, where time is a continuous variable inside the network rather than a discrete sequence index:
+This repo implements and compares a family of models built specifically for that setting, where time is a continuous variable inside the network rather than a discrete sequence index. The full mathematical derivation of each model is in [`docs/theory.md`](docs/theory.md); the summary below is intentionally informal.
 
 - **Neural ODEs** (Chen, Rubanova, Bettencourt & Duvenaud, *NeurIPS 2018*, Best Paper Award) parameterize the derivative of a hidden state with a neural network, `dz/dt = f(z, t)`, and obtain `z` at any time via a numerical ODE solver.
 - **Latent ODEs** (Rubanova, Chen & Duvenaud, *NeurIPS 2019*) apply this to irregular time series: an RNN encodes a patient's sparse observations into a distribution over an initial latent state `z0`; an ODE solver integrates it forward continuously; a decoder reads off predictions at arbitrary times, including ones never observed.
@@ -26,7 +26,7 @@ For that reason, `src/models/baselines.py` includes a `PersistenceBaseline` with
 bash data/download_physionet2012.sh
 ```
 
-This downloads `set-a` (4,000 records with outcome labels — the only split with labels available outside the original Challenge, and the one used throughout this repo) into `data/raw/`.
+This downloads the released Set A, Set B, and Set C archives plus their now-public outcome files into `data/raw/`. Competition-faithful experiments use Set A outcomes for development/training; B/C outcomes are reserved for retrospective scoring only.
 
 A synthetic data generator (`src/data/synthetic.py`) produces structurally identical fake records, so the full pipeline can be exercised without the download:
 
@@ -51,7 +51,7 @@ src/models/baselines.py      PersistenceBaseline, GRU, GRU-D (Che et al. 2018)
 src/models/latent_ode.py     Latent ODE (Rubanova et al. 2019), via torchdiffeq
 src/models/neural_cde.py     Neural CDE (Kidger et al. 2020), via torchcde
 src/training/train.py        trains and evaluates every model, prints a comparison table
-src/training/metrics.py      AUROC / AUPRC
+src/training/metrics.py      AUROC / AUPRC + official Challenge Event 1 / Event 2
 tests/                       data-pipeline tests and forward/backward-pass tests per model
 configs/default.yaml         reference hyperparameters for a full run
 ```
@@ -79,13 +79,13 @@ A natural extension is to drop the binning and integrate on the true union of ob
 
 *To be filled in after a full run on real data (`python -m src.training.train --data-dir data/raw --epochs 30`).*
 
-| Model | AUROC | AUPRC |
-|---|---|---|
-| Persistence baseline | | |
-| GRU | | |
-| GRU-D | | |
-| Latent ODE | | |
-| Neural CDE | | |
+| Model | AUROC | AUPRC | Event 1 | Event 2 |
+|---|---:|---:|---:|---:|
+| Persistence baseline | | | | |
+| GRU | | | | |
+| GRU-D | | | | |
+| Latent ODE | | | | |
+| Neural CDE | | | | |
 
 ## Known simplifications
 
