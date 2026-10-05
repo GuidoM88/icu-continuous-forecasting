@@ -1,20 +1,15 @@
 """
-Trains and compares every model in this repo on in-hospital-mortality
-classification, and prints/saves a results table.
+Set-A development utility for comparing the research models.
 
-Usage:
-    # instant sanity run on fake data, no download needed:
-    python -m src.training.train --synthetic --epochs 3
-
-    # real PhysioNet-2012 data (after running data/download_physionet2012.sh):
-    python -m src.training.train --data-dir data/raw --epochs 30
-
-    # just one or two models, e.g. while iterating on Neural CDE:
-    python -m src.training.train --synthetic --models persistence neural_cde
+Model selection is restricted to a stratified Set-A train/validation split.
+Sets B and C are intentionally absent from this script. Final all-A training
+and artifact export for the selected GRU are handled by
+`src.training.finalize_gru`.
 """
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import random
 import time
@@ -25,210 +20,432 @@ import torch
 import torch.nn as nn
 
 from src.data.physionet import load_split
-from src.data.preprocessing import Physionet2012Dataset, build_vocab
+from src.data.preprocessing import Physionet2012Dataset, build_vocab, fill_forward
 from src.data.synthetic import make_synthetic_records
 from src.models.baselines import GRUD, GRUBaseline, PersistenceBaseline
 from src.models.latent_ode import LatentODE, kl_standard_normal, masked_mse
 from src.models.neural_cde import NeuralCDE
-from src.training.metrics import classification_metrics
+from src.training.metrics import (
+    challenge_metrics,
+    classification_metrics,
+    select_event1_threshold,
+)
 
 ALL_MODELS = ["persistence", "gru", "grud", "latent_ode", "neural_cde"]
 
 
-def set_seed(seed: int):
+def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
 
-def stratified_split(records, val_frac=0.1, test_frac=0.1, seed=0):
+def stratified_split(records, val_frac: float = 0.20, seed: int = 42):
     rng = random.Random(seed)
     by_label = {0: [], 1: []}
-    for i, r in enumerate(records):
-        if r.label is not None:
-            by_label[r.label].append(i)
-    train_idx, val_idx, test_idx = [], [], []
-    for label, idxs in by_label.items():
-        rng.shuffle(idxs)
-        n = len(idxs)
-        n_val, n_test = int(n * val_frac), int(n * test_frac)
-        val_idx += idxs[:n_val]
-        test_idx += idxs[n_val : n_val + n_test]
-        train_idx += idxs[n_val + n_test :]
-    rng.shuffle(train_idx)
-    return train_idx, val_idx, test_idx
 
-
-def iterate_batches(dataset, indices, batch_size, shuffle=True, seed=0):
-    idx = list(indices)
-    if shuffle:
-        random.Random(seed).shuffle(idx)
-    for i in range(0, len(idx), batch_size):
-        chunk = idx[i : i + batch_size]
-        if len(chunk) < 2:  # BatchNorm-free models don't need this, but AUROC does
+    for i, record in enumerate(records):
+        if record.label is None:
             continue
-        yield dataset.collate(chunk)
+        by_label[int(record.label)].append(i)
+
+    train_idx, val_idx = [], []
+
+    for indices in by_label.values():
+        rng.shuffle(indices)
+        n_val = int(round(len(indices) * val_frac))
+        val_idx.extend(indices[:n_val])
+        train_idx.extend(indices[n_val:])
+
+    rng.shuffle(train_idx)
+    rng.shuffle(val_idx)
+    return train_idx, val_idx
+
+
+def iterate_batches(
+    dataset,
+    indices,
+    batch_size,
+    *,
+    shuffle=False,
+    seed=42,
+):
+    ids = np.asarray(indices, dtype=int).copy()
+
+    if shuffle:
+        rng = np.random.RandomState(seed)
+        rng.shuffle(ids)
+
+    for start in range(0, len(ids), batch_size):
+        yield dataset.collate(ids[start : start + batch_size].tolist())
 
 
 def build_model(name: str, input_dim: int, static_dim: int, device):
     if name == "persistence":
-        return PersistenceBaseline(input_dim, static_dim).to(device)
+        model = PersistenceBaseline(input_dim, static_dim)
+    elif name == "gru":
+        model = GRUBaseline(input_dim, static_dim)
+    elif name == "grud":
+        model = GRUD(input_dim, static_dim)
+    elif name == "latent_ode":
+        model = LatentODE(
+            input_dim,
+            static_dim,
+            latent_dim=16,
+            hidden=64,
+            solver="dopri5",
+        )
+    elif name == "neural_cde":
+        model = NeuralCDE(
+            input_dim,
+            static_dim,
+            hidden_channels=32,
+            hidden=64,
+            interpolation="cubic",
+            solver="rk4",
+            step_size=1.0,
+        )
+    else:
+        raise ValueError(f"Unknown model {name!r}")
+
+    return model.to(device)
+
+
+def filled_from_batch(batch):
+    values = batch.values.detach().cpu().numpy()
+    mask = batch.mask.detach().cpu().numpy()
+    filled = fill_forward(values, mask).astype(np.float32)
+    return torch.from_numpy(filled).to(batch.values.device)
+
+
+def forward_logits(name, model, batch, *, training: bool):
+    if name == "persistence":
+        return model(batch), None
+
     if name == "gru":
-        return GRUBaseline(input_dim, static_dim).to(device)
+        return model(batch, filled_from_batch(batch)), None
+
     if name == "grud":
-        return GRUD(input_dim, static_dim).to(device)
+        x_mean = torch.zeros(
+            batch.values.shape[-1],
+            dtype=batch.values.dtype,
+            device=batch.values.device,
+        )
+        return model(batch, x_mean), None
+
     if name == "latent_ode":
-        return LatentODE(input_dim, static_dim).to(device)
+        logits, recon, mean, logvar = model(
+            batch,
+            filled_from_batch(batch),
+            sample=training,
+        )
+        return logits, (recon, mean, logvar)
+
     if name == "neural_cde":
-        return NeuralCDE(input_dim, static_dim).to(device)
-    raise ValueError(f"Unknown model {name!r}, choose from {ALL_MODELS}")
+        return model(batch), None
+
+    raise ValueError(name)
 
 
-def run_epoch(model_name, model, dataset, indices, batch_size, device, optimizer=None):
-    train_mode = optimizer is not None
-    model.train(train_mode)
+def train_epoch(
+    name,
+    model,
+    dataset,
+    indices,
+    optimizer,
+    batch_size,
+    device,
+    epoch,
+    seed,
+):
+    model.train()
     bce = nn.BCEWithLogitsLoss()
 
-    all_labels, all_scores, losses = [], [], []
-    for batch in iterate_batches(dataset, indices, batch_size, shuffle=train_mode):
+    total_loss = 0.0
+    total_n = 0
+
+    for batch in iterate_batches(
+        dataset,
+        indices,
+        batch_size,
+        shuffle=True,
+        seed=seed + epoch,
+    ):
         batch = batch.to(device)
-        from src.data.preprocessing import fill_forward
+        optimizer.zero_grad(set_to_none=True)
 
-        filled = None
-        if model_name in ("gru", "latent_ode"):
-            filled = torch.from_numpy(
-                fill_forward(
-                    torch.nan_to_num(batch.values, nan=float("nan")).cpu().numpy(),
-                    batch.mask.cpu().numpy(),
-                )
-            ).to(device)
+        logits, aux = forward_logits(name, model, batch, training=True)
+        loss = bce(logits, batch.labels.float())
 
-        if model_name == "latent_ode":
-            logits, recon, mean, logvar = model(batch, filled)
-            recon_loss = masked_mse(recon, batch.values, batch.mask).mean()
-            kl = kl_standard_normal(mean, logvar).mean()
-            cls_loss = bce(logits, batch.labels)
-            loss = cls_loss + 0.1 * recon_loss + 1e-3 * kl
-        elif model_name in ("gru", "grud"):
-            if model_name == "grud":
-                x_mean = torch.zeros(batch.values.shape[-1])  # values are normalised -> mean 0
-                logits = model(batch, x_mean)
-            else:
-                logits = model(batch, filled)
-            loss = bce(logits, batch.labels)
-        else:  # persistence, neural_cde
-            logits = model(batch)
-            loss = bce(logits, batch.labels)
+        if name == "latent_ode":
+            recon, mean, logvar = aux
+            loss = (
+                loss
+                + 0.1 * masked_mse(recon, batch.values, batch.mask).mean()
+                + 1e-3 * kl_standard_normal(mean, logvar).mean()
+            )
 
-        if train_mode:
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            optimizer.step()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+        optimizer.step()
 
-        losses.append(loss.item())
-        all_labels.append(batch.labels.detach().cpu().numpy())
-        all_scores.append(torch.sigmoid(logits).detach().cpu().numpy())
+        n = len(batch.labels)
+        total_loss += float(loss.detach()) * n
+        total_n += n
 
-    y_true = np.concatenate(all_labels) if all_labels else np.array([])
-    y_score = np.concatenate(all_scores) if all_scores else np.array([])
-    metrics = classification_metrics(y_true, y_score)
-    metrics["loss"] = float(np.mean(losses)) if losses else float("nan")
-    return metrics
+    return total_loss / max(total_n, 1)
 
 
-def train_one_model(name, dataset_train, dataset_val, dataset_test, train_idx, val_idx, test_idx,
-                     input_dim, static_dim, device, epochs, batch_size, lr):
+@torch.no_grad()
+def predict(
+    name,
+    model,
+    dataset,
+    indices,
+    batch_size,
+    device,
+):
+    model.eval()
+    labels, scores = [], []
+
+    for batch in iterate_batches(
+        dataset,
+        indices,
+        batch_size,
+        shuffle=False,
+    ):
+        batch = batch.to(device)
+        logits, _ = forward_logits(name, model, batch, training=False)
+        labels.append(batch.labels.cpu().numpy())
+        scores.append(torch.sigmoid(logits).cpu().numpy())
+
+    return np.concatenate(labels), np.concatenate(scores)
+
+
+def train_one_model(
+    name,
+    dataset,
+    train_idx,
+    val_idx,
+    *,
+    input_dim,
+    static_dim,
+    device,
+    max_epochs,
+    patience,
+    batch_size,
+    lr,
+    seed,
+):
+    set_seed(seed)
     model = build_model(name, input_dim, static_dim, device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    best_val_auroc, best_state = -1.0, None
+    best_auprc = -np.inf
+    best_state = None
+    best_epoch = None
+    stale = 0
     history = []
-    for epoch in range(epochs):
-        t0 = time.time()
-        train_m = run_epoch(name, model, dataset_train, train_idx, batch_size, device, optimizer)
-        with torch.no_grad():
-            val_m = run_epoch(name, model, dataset_val, val_idx, batch_size, device, optimizer=None)
-        history.append({"epoch": epoch, "train": train_m, "val": val_m, "sec": time.time() - t0})
-        print(
-            f"  [{name}] epoch {epoch:02d}  train_loss={train_m['loss']:.4f}  "
-            f"val_auroc={val_m['auroc']:.4f}  val_auprc={val_m['auprc']:.4f}  "
-            f"({time.time() - t0:.1f}s)"
-        )
-        if val_m["auroc"] == val_m["auroc"] and val_m["auroc"] > best_val_auroc:  # not NaN
-            best_val_auroc = val_m["auroc"]
-            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
 
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    with torch.no_grad():
-        test_m = run_epoch(name, model, dataset_test, test_idx, batch_size, device, optimizer=None)
-    return model, test_m, history
+    for epoch in range(1, max_epochs + 1):
+        t0 = time.perf_counter()
+
+        train_loss = train_epoch(
+            name,
+            model,
+            dataset,
+            train_idx,
+            optimizer,
+            batch_size,
+            device,
+            epoch,
+            seed,
+        )
+
+        y_val, risk_val = predict(
+            name,
+            model,
+            dataset,
+            val_idx,
+            batch_size,
+            device,
+        )
+        metrics = classification_metrics(y_val, risk_val)
+
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_auroc": metrics["auroc"],
+                "val_auprc": metrics["auprc"],
+                "seconds": time.perf_counter() - t0,
+            }
+        )
+
+        improved = (
+            np.isfinite(metrics["auprc"])
+            and metrics["auprc"] > best_auprc
+        )
+
+        if improved:
+            best_auprc = metrics["auprc"]
+            best_state = copy.deepcopy(model.state_dict())
+            best_epoch = epoch
+            stale = 0
+        else:
+            stale += 1
+
+        print(
+            f"[{name}] {epoch:02d} "
+            f"loss={train_loss:.4f} "
+            f"val_AUROC={metrics['auroc']:.4f} "
+            f"val_AUPRC={metrics['auprc']:.4f}"
+        )
+
+        if stale >= patience:
+            break
+
+    if best_state is None:
+        raise RuntimeError(f"No valid validation checkpoint for {name}")
+
+    model.load_state_dict(best_state)
+
+    y_val, risk_val = predict(
+        name,
+        model,
+        dataset,
+        val_idx,
+        batch_size,
+        device,
+    )
+    threshold = select_event1_threshold(y_val, risk_val)
+    val_metrics = challenge_metrics(y_val, risk_val, threshold)
+
+    return {
+        "selected_epoch": int(best_epoch),
+        "threshold": float(threshold),
+        "validation": val_metrics,
+        "history": history,
+    }
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", type=str, default="data/raw")
-    parser.add_argument("--synthetic", action="store_true", help="use fake data, no download needed")
+    parser.add_argument("--data-dir", default="data/raw")
+    parser.add_argument("--synthetic", action="store_true")
     parser.add_argument("--synthetic-n", type=int, default=600)
-    parser.add_argument("--models", nargs="+", default=ALL_MODELS, choices=ALL_MODELS)
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        default=ALL_MODELS,
+        choices=ALL_MODELS,
+    )
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--patience", type=int, default=6)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--out", type=str, default="results/results.json")
+    parser.add_argument("--val-frac", type=float, default=0.20)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--device",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+    )
+    parser.add_argument(
+        "--out",
+        default="results/development.json",
+    )
     args = parser.parse_args()
 
     set_seed(args.seed)
     device = torch.device(args.device)
 
     if args.synthetic:
-        print(f"Generating {args.synthetic_n} synthetic records (no PhysioNet download needed)...")
-        records = make_synthetic_records(n=args.synthetic_n, seed=args.seed)
+        records = make_synthetic_records(
+            n=args.synthetic_n,
+            seed=args.seed,
+        )
     else:
-        print(f"Loading real PhysioNet-2012 records from {args.data_dir} ...")
-        records = load_split(Path(args.data_dir), split="set-a")
+        records = load_split(
+            Path(args.data_dir),
+            split="set-a",
+        )
 
-    n_before = len(records)
-    records = [r for r in records if r.label is not None]
-    if len(records) < n_before:
-        print(f"dropped {n_before - len(records)} records with no known outcome")
+    records = [record for record in records if record.label is not None]
 
-    train_idx, val_idx, test_idx = stratified_split(records, seed=args.seed)
-    print(f"records: {len(records)}  train/val/test: {len(train_idx)}/{len(val_idx)}/{len(test_idx)}")
+    train_idx, val_idx = stratified_split(
+        records,
+        val_frac=args.val_frac,
+        seed=args.seed,
+    )
 
-    vocab = build_vocab([records[i] for i in train_idx])
-    print(f"variable vocabulary size: {len(vocab)}")
-
-    # Fit the normalizer on the TRAIN split only (never on val/test), then reuse
-    # those statistics for every split -- standard practice to avoid leakage.
     train_records = [records[i] for i in train_idx]
-    normalizer = Physionet2012Dataset(train_records, vocab).fit_normalizer()
-    ds = Physionet2012Dataset(records, vocab, normalizer=normalizer)
-    input_dim, static_dim = len(vocab), len(ds.static_names)
+    vocab = build_vocab(train_records)
+
+    train_ds = Physionet2012Dataset(train_records, vocab)
+    normalizer = train_ds.fit_normalizer()
+
+    dataset = Physionet2012Dataset(
+        records,
+        vocab,
+        normalizer=normalizer,
+    )
+
+    print(
+        f"records={len(records)} "
+        f"train={len(train_idx)} "
+        f"val={len(val_idx)} "
+        f"vocab={len(vocab)} "
+        f"device={device}"
+    )
 
     results = {}
+
     for name in args.models:
-        print(f"\n=== training {name} ===")
-        _, test_m, history = train_one_model(
-            name, ds, ds, ds, train_idx, val_idx, test_idx,
-            input_dim, static_dim, device, args.epochs, args.batch_size, args.lr,
+        print(f"\n=== {name} ===")
+        results[name] = train_one_model(
+            name,
+            dataset,
+            train_idx,
+            val_idx,
+            input_dim=len(vocab),
+            static_dim=len(dataset.static_names),
+            device=device,
+            max_epochs=args.epochs,
+            patience=args.patience,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            seed=args.seed,
         )
-        print(f"  -> TEST  auroc={test_m['auroc']:.4f}  auprc={test_m['auprc']:.4f}")
-        results[name] = {"test": test_m, "history": history}
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w") as f:
-        json.dump(results, f, indent=2)
+    out_path.write_text(
+        json.dumps(results, indent=2),
+        encoding="utf-8",
+    )
 
-    print("\n=== summary (test set) ===")
-    print(f"{'model':<14}{'AUROC':>10}{'AUPRC':>10}")
-    for name in args.models:
-        m = results[name]["test"]
-        print(f"{name:<14}{m['auroc']:>10.4f}{m['auprc']:>10.4f}")
-    print(f"\nsaved full results to {out_path}")
+    print("\n=== Set-A validation summary ===")
+    print(
+        f"{'model':<14}"
+        f"{'epoch':>8}"
+        f"{'AUROC':>10}"
+        f"{'AUPRC':>10}"
+        f"{'Event1':>10}"
+        f"{'threshold':>12}"
+    )
+
+    for name, result in results.items():
+        metrics = result["validation"]
+        print(
+            f"{name:<14}"
+            f"{result['selected_epoch']:>8}"
+            f"{metrics['auroc']:>10.4f}"
+            f"{metrics['auprc']:>10.4f}"
+            f"{metrics['event1']:>10.4f}"
+            f"{result['threshold']:>12.4f}"
+        )
+
+    print(f"\nsaved: {out_path}")
 
 
 if __name__ == "__main__":

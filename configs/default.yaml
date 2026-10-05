@@ -1,26 +1,35 @@
-# Reference hyperparameters for a real PhysioNet-2012 run.
-# train.py currently takes these as CLI flags (see `python -m src.training.train --help`);
-# this file documents the recommended starting point.
+# Reference configuration for the Set-A development protocol.
 
 data:
   max_hours: 48.0
-  bin_size_hours: 1.0        # hourly grid; see src/data/preprocessing.py docstring
-  val_frac: 0.1
-  test_frac: 0.1
+  bin_size_hours: 1.0
+  val_frac: 0.20
 
 training:
-  epochs: 30
-  batch_size: 32
+  max_epochs: 30
+  patience: 6
+  batch_size: 128
   lr: 0.001
-  seed: 0
+  grad_clip: 5.0
+  seed: 42
+  selection_metric: auprc
 
-model_dims:
+models:
   hidden: 64
+
   latent_ode:
     latent_dim: 16
-    solver: dopri5           # swap to 'rk4' + fixed step for a 5-10x speedup while iterating
+    solver: dopri5
+    reconstruction_weight: 0.1
+    kl_weight: 0.001
+
   neural_cde:
     hidden_channels: 32
-    interpolation: cubic     # 'linear' is faster and a fine default while debugging
+    interpolation: cubic
     solver: rk4
     step_size: 1.0
+
+final_model:
+  name: gru
+  epochs: 11
+  threshold: 0.2571

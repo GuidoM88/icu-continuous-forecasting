@@ -1,0 +1,20 @@
+Copy these files into the repository using the same relative paths.
+
+README.md
+docs/theory.md
+docs/experimental_protocol.md
+src/training/train.py
+src/models/latent_ode.py
+configs/default.yaml
+.github/workflows/ci.yml
+pytest.ini
+
+After copying:
+
+python -m pytest -q
+
+Optional quick development check:
+
+python -m src.training.train --synthetic --epochs 3 --models persistence gru
+
+The final model artifact and production files already created earlier remain unchanged.
