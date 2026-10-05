@@ -1,19 +1,15 @@
 """
-Baselines for the in-hospital-mortality classification task.
+Baseline models for in-hospital mortality prediction.
 
-- PersistenceBaseline: a deliberately "dumb" model with NO learned dynamics
-  -- just summary statistics (last value, mean, #observations per variable)
-  fed to a small MLP. This is the trivial baseline that Klötergens et al.
-  (Physiome-ODE, ICLR 2025) showed is competitive with -- and sometimes
-  beats -- full neural-ODE models on the standard IMTS forecasting
-  benchmarks. Report it for EVERY experiment: if Latent-ODE / Neural-CDE
-  can't clear it by a real margin, the added complexity isn't earning its
-  keep on this task, and that is itself worth knowing and saying out loud.
-- GRUBaseline: a standard GRU fed (forward-filled value, mask, delta_t).
-- GRUD: Che et al. 2018, "Recurrent Neural Networks for Multivariate Time
-  Series with Missing Values" (Scientific Reports). Input- and hidden-state
-  decay driven by time-since-last-observation. This is the standard strong
-  baseline used in the Latent-ODE and Neural-CDE papers themselves.
+PersistenceBaseline summarizes each dynamic variable with its last observed
+value, mean and observation count, then combines those features with static
+covariates in a small MLP.
+
+GRUBaseline processes forward-filled values together with observation masks
+and time-since-last-observation features.
+
+GRUD implements the decay-based recurrent formulation of Che et al. (2018),
+with learned input and hidden-state decay driven by elapsed time.
 """
 from __future__ import annotations
 
